@@ -173,7 +173,7 @@ INVERSION_COLS = ['as_revel', 'as_polyphen', 'as_cadd',
                   'as_alphamissense', 'as_plddt']
 
 # ADVI configuration.
-# Fullrank ADVI estimates a full P×P covariance over P=4N+8 parameters.
+# Fullrank ADVI estimates a full P×P covariance over P=4N+10 parameters.
 # For N>200 variants (~808 params), this is O(P²) ≈ 653K entries per
 # iteration and becomes prohibitively slow (hours for N~1000).
 # Above this threshold we skip straight to meanfield (diagonal covariance).
@@ -539,7 +539,7 @@ def AS_multiVars(df, gene, return_variant_outputs=False):
     N = len(df)
 
     # Choose ADVI algorithm based on variant count.
-    # Fullrank estimates a full P×P covariance (P=4N+8 params).
+    # Fullrank estimates a full P×P covariance (P=4N+10 params).
     # For N>FULLRANK_MAX_N this is prohibitively slow — a single
     # N=1000 disease can take 4+ hours on fullrank.
     # Meanfield uses a diagonal covariance and is orders of magnitude faster.

@@ -50,6 +50,11 @@ parameters {
   vector[5] slope_random; // Random effects for the slope
   vector[N] protein_prior;
   vector[N] disease_prior;
+  // Residual SD of true variant effects around the dose-response line (log-OR scale).
+  // Measurement error is already carried by xc ~ normal(xcest, xcse) and
+  // yOR ~ normal(yORest, yORse), so these capture between-variant scatter only.
+  real<lower=0> sigma_qtl;  // eQTL / pQTL branches
+  real<lower=0> sigma_rare; // coding GWAS / AZ branches
 }
 transformed parameters {
   // This section if to determine where the information is present - used at the end in the hierarchical model
@@ -115,6 +120,9 @@ intercept_random ~ normal(0, 10);
 // Slope prior — normal(0, 5) matches single-variant model; slope of ±5 is already extreme (e^5 ≈ 150-fold risk)
 slope ~ normal( 0, 5 );
 slope_random ~ normal( 0, 5 );
+// Half-normal priors for the residual SDs; rare-variant effects are larger, so wider prior
+sigma_qtl ~ normal( 0, 0.5 );
+sigma_rare ~ normal( 0, 1 );
 
 // Posterior for the intercept
 // if not empty use the following bO prior
@@ -134,20 +142,24 @@ yOR ~ normal( yORest, yORse);
 // The calculation of the sd for the regression comes form Sun et al. 2022 Nature - Genetic associations of protein-coding variants in human disease
 for (n in 1:N) {
   if (numG1[n] == 0) { // Common variants
+    // Residual scale is estimated (sigma_qtl), not abs(yOR)/abs(xc): that term
+    // grew with each variant's own effect size, down-weighting strong variants.
     if ( numG2[n] == 0 ) { // eQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], abs(yOR[n]) / fmax(abs(xc[n]), 0.01));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[1], sigma_qtl);
     } else
     if ( numG2[n] == 1 ) { // pQTL
-      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], abs(yOR[n]) / fmax(abs(xc[n]), 0.01));
+      yORest[n] ~ student_t( nu, xcest[n] * slope_random[2], sigma_qtl);
       }
     }
   else
+  // Residual scale is estimated (sigma_rare), not abs(yOR/protein_prior): that term
+  // diverged as protein_prior -> 0, giving LoF variants almost no weight.
   if (numG1[n] == 3) { // common coding GWAS
-    yORest[n] ~ student_t( nu, intercept_random + protein_prior[n] * slope_random[3], abs(yOR[n] / protein_prior[n]) );
+    yORest[n] ~ student_t( nu, intercept_random + protein_prior[n] * slope_random[3], sigma_rare );
   }
   else
   if (numG1[n] == 1) { // AZ PheWAS
-    yORest[n] ~ student_t( nu, intercept_random + slope_random[4] * protein_prior[n], abs(yOR[n] / protein_prior[n]) );
+    yORest[n] ~ student_t( nu, intercept_random + slope_random[4] * protein_prior[n], sigma_rare );
   }
   else
   if (numG1[n] == 2) { // ClinVar rare variants
