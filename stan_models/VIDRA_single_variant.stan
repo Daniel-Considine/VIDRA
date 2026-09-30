@@ -67,9 +67,12 @@ if (has_burden == 1) {
 
 if (numG1 == 0) { // QTL common variants (eQTL or pQTL)
   xc ~ normal( xcest, xcse);
+  // Wald ratio with delta-method (second-order) SE, which includes the QTL
+  // uncertainty xcse. The legacy SD abs(yORse/xcest) ignored xcse and divided by
+  // a parameter, giving unreliable fits for weakly measured QTLs.
   // Guard against division by zero — xc is DATA (0.0 when QTL effect missing)
   if (abs(xc) > 1e-4)
-    slope ~ normal(yOR / xc, abs(yORse/xcest));
+    slope ~ normal(yOR / xc, sqrt(square(yORse / xc) + square(yOR * xcse / square(xc))));
   }
 else
 if (numG1 == 1) { // AZ PheWAS rare variants

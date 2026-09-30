@@ -3,8 +3,7 @@
 Reads analysis-ready data (Hive-partitioned by as_gene, 1 parquet file per gene),
 joins variant annotations (38 MB broadcast table), applies direction inversions
 and normalisations, then runs per-(gene, disease) Bayesian hierarchical models
-via CmdStanPy (variational inference for multi-variant pairs, NUTS for
-single-variant pairs) and writes posterior summaries to parquet.
+via CmdStanPy variational inference and writes posterior summaries to parquet.
 
 Pipeline position:
   1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/        (1 file per gene)
@@ -181,13 +180,6 @@ FULLRANK_MAX_N = 200   # max variants before forcing meanfield
 ADVI_MAX_ITER = 10000  # CmdStan default; explicit for clarity
 ADVI_GRAD_SAMPLES = 20
 ADVI_DRAWS = 1000
-
-# NUTS configuration for the single-variant model (4 x 250 = 1000 draws,
-# matching ADVI_DRAWS). Chains run sequentially: Spark already uses every core.
-SV_NUTS_CHAINS = 4
-SV_NUTS_WARMUP = 1000
-SV_NUTS_SAMPLES = 250
-SV_NUTS_ADAPT_DELTA = 0.95
 
 # Posterior summary column names (Spark-safe — no special chars)
 POSTERIOR_COLS = [
@@ -372,7 +364,7 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
         return_variant_outputs: if True, return per-variant posterior
             summaries for xcest/yORest instead of the gene-disease slope.
 
-    Fitted with NUTS. QTL variants always fit; AZ variants fit only when the
+    Fitted with fullrank ADVI. QTL variants always fit; AZ variants fit only when the
     pair has a burden test (the intercept). ClinVar variants, and AZ variants
     without burden, get a 'single_variant_unidentified' row with no posterior.
 
@@ -433,20 +425,18 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
     # Use Spark's scratch SSD for Stan I/O — /tmp is a size-capped tmpfs
     # that causes EPERM for large gene-disease pairs.
     scratch = _get_scratch_dir()
-    # NUTS rather than ADVI: the model has 6 parameters, so sampling is cheap,
-    # and ADVI's fixed-seed approximation biased weakly-identified slopes.
     with tempfile.TemporaryDirectory(prefix='stan_sv_', dir=scratch) as tmpdir:
-        fit = model.sample(
-            data=df_dict, seed=412,
-            chains=SV_NUTS_CHAINS, parallel_chains=1,
-            iter_warmup=SV_NUTS_WARMUP, iter_sampling=SV_NUTS_SAMPLES,
-            adapt_delta=SV_NUTS_ADAPT_DELTA,
-            show_progress=False, output_dir=tmpdir
+        fit = model.variational(
+            data=df_dict, seed=412, algorithm='fullrank',
+            iter=ADVI_MAX_ITER,
+            grad_samples=ADVI_GRAD_SAMPLES, draws=ADVI_DRAWS,
+            require_converged=False, show_console=True, refresh=1000,
+            output_dir=tmpdir
         )
         if return_variant_outputs:
-            posteriors = fit.draws_pd()
+            posteriors = fit.variational_sample_pd
         else:
-            slope_posteriors = fit.stan_variable('slope')
+            slope_posteriors = fit.stan_variable('slope', mean=False)
 
     source_str = str(int(df_dict['numG1']))
     qtl_str = str(int(df_dict['numG2']))
