@@ -3,7 +3,8 @@
 Reads analysis-ready data (Hive-partitioned by as_gene, 1 parquet file per gene),
 joins variant annotations (38 MB broadcast table), applies direction inversions
 and normalisations, then runs per-(gene, disease) Bayesian hierarchical models
-via CmdStanPy variational inference and writes posterior summaries to parquet.
+via CmdStanPy (variational inference for multi-variant pairs, NUTS for
+single-variant pairs) and writes posterior summaries to parquet.
 
 Pipeline position:
   1. prepare_analysis_input.py → gs://<bucket>/vidra_analysis_ready/        (1 file per gene)
@@ -39,7 +40,9 @@ Output columns (gs://<bucket>/vidra_results<output_suffix>/):
   has_burden
   Where `parameter` ∈ {'slope', 'intercept', 'slope_random[1..5]', 'meta_slope'}
   for gene-disease summary rows; 'error_report' rows carry the Stan exception
-  message in the `parameter` column.
+  message in the `parameter` column. `model='single_variant_unidentified'`
+  rows (single ClinVar variant, or single AZ variant without burden) have
+  null posterior columns: the slope is not identified from that data.
 
 Debug output schemas (opt-in):
   --save_stan_inputs → gs://<bucket>/stan_inputs<output_suffix>/, partitioned
@@ -178,6 +181,13 @@ FULLRANK_MAX_N = 200   # max variants before forcing meanfield
 ADVI_MAX_ITER = 10000  # CmdStan default; explicit for clarity
 ADVI_GRAD_SAMPLES = 20
 ADVI_DRAWS = 1000
+
+# NUTS configuration for the single-variant model (4 x 250 = 1000 draws,
+# matching ADVI_DRAWS). Chains run sequentially: Spark already uses every core.
+SV_NUTS_CHAINS = 4
+SV_NUTS_WARMUP = 1000
+SV_NUTS_SAMPLES = 250
+SV_NUTS_ADAPT_DELTA = 0.95
 
 # Posterior summary column names (Spark-safe — no special chars)
 POSTERIOR_COLS = [
@@ -362,6 +372,10 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
         return_variant_outputs: if True, return per-variant posterior
             summaries for xcest/yORest instead of the gene-disease slope.
 
+    Fitted with NUTS. QTL variants always fit; AZ variants fit only when the
+    pair has a burden test (the intercept). ClinVar variants, and AZ variants
+    without burden, get a 'single_variant_unidentified' row with no posterior.
+
     Returns:
         pandas DataFrame with posterior summaries, or None on failure.
         Schema depends on return_variant_outputs.
@@ -371,11 +385,35 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
         return None
 
     row = df.iloc[0]
+    source = int(_safe_float(row['GsourceLab']))
+    bO = _safe_float(row.get('bO', 0.0))
+    has_burden = bO != 0.0
+
+    # A single rare variant only identifies a slope when it has a measured
+    # effect AND a burden test to anchor the intercept. ClinVar has no
+    # measured effect; AZ without burden cannot separate slope from intercept.
+    if source == 2 or (source == 1 and not has_burden):
+        if return_variant_outputs:
+            return pd.DataFrame(columns=ALL_VARIANT_OUTPUT_COLS)
+        return pd.DataFrame([{
+            'gene': gene,
+            'as_disease': str(df['as_disease'].iloc[0]),
+            'n_variants': int(df['variant'].nunique()),
+            'source': str(source),
+            'qtl': str(int(_safe_float(row['GqtlLab']))),
+            'model': 'single_variant_unidentified',
+            'parameter': 'slope',
+            'has_burden': has_burden,
+        }])
+
     df_dict = {
         'h1': float(h1),
         'N': len(df),
-        'numG1': _safe_float(row['GsourceLab']),
+        'numG1': float(source),
         'numG2': _safe_float(row['GqtlLab']),
+        'bO': bO,
+        'bOse': max(_safe_float(row.get('bOse', 2.0), 2.0), 1e-6),
+        'has_burden': int(has_burden),
         'xc': _safe_float(row['xc'], 0.0),
         'xcse': max(_safe_float(row['xcse'], 0.1), 1e-6),
         'yOR': _safe_float(row['yc']),
@@ -395,18 +433,20 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
     # Use Spark's scratch SSD for Stan I/O — /tmp is a size-capped tmpfs
     # that causes EPERM for large gene-disease pairs.
     scratch = _get_scratch_dir()
+    # NUTS rather than ADVI: the model has 6 parameters, so sampling is cheap,
+    # and ADVI's fixed-seed approximation biased weakly-identified slopes.
     with tempfile.TemporaryDirectory(prefix='stan_sv_', dir=scratch) as tmpdir:
-        fit = model.variational(
-            data=df_dict, seed=412, algorithm='fullrank',
-            iter=ADVI_MAX_ITER,
-            grad_samples=ADVI_GRAD_SAMPLES, draws=ADVI_DRAWS,
-            require_converged=False, show_console=True, refresh=1000,
-            output_dir=tmpdir
+        fit = model.sample(
+            data=df_dict, seed=412,
+            chains=SV_NUTS_CHAINS, parallel_chains=1,
+            iter_warmup=SV_NUTS_WARMUP, iter_sampling=SV_NUTS_SAMPLES,
+            adapt_delta=SV_NUTS_ADAPT_DELTA,
+            show_progress=False, output_dir=tmpdir
         )
         if return_variant_outputs:
-            posteriors = fit.variational_sample_pd
+            posteriors = fit.draws_pd()
         else:
-            slope_posteriors = fit.stan_variable('slope', mean=False)
+            slope_posteriors = fit.stan_variable('slope')
 
     source_str = str(int(df_dict['numG1']))
     qtl_str = str(int(df_dict['numG2']))
@@ -423,7 +463,7 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
         out['as_disease'] = as_disease
         out['n_variants'] = n_variants
         out['model'] = 'single_variant'
-        out['has_burden'] = False
+        out['has_burden'] = has_burden
         return out
 
     res = clean_posteriorForAs(slope_posteriors)
@@ -434,7 +474,7 @@ def AS_singleVars(df, gene, h1=0.1, return_variant_outputs=False):
     res['qtl'] = qtl_str
     res['model'] = 'single_variant'
     res['parameter'] = 'slope'
-    res['has_burden'] = False
+    res['has_burden'] = has_burden
     return pd.DataFrame([res])
 
 
@@ -675,7 +715,7 @@ def preprocess_gene(gene_df):
       1. Compute per-gene FoldX transform
       2. Fill annotation defaults + per-gene mean imputation + LoF hardcoding
       3. Dedup variants within (disease, source, qtl) — keep highest yc
-      4. Filter out single-variant coding GWAS groups (GsourceLab==3)
+      4. Drop coding GWAS rows (GsourceLab==3) from single-variant pairs
 
     Args:
         gene_df: pandas DataFrame for one gene (all diseases/variants)
@@ -753,13 +793,12 @@ def preprocess_gene(gene_df):
     )
 
     # --- Filter single-variant coding GWAS ---
-    gene_df = gene_df.groupby(
-        ['as_disease', 'GsourceLab', 'GqtlLab'], group_keys=False
-    ).filter(
-        lambda x: not (
-            (len(x['variant']) == 1) and (x['GsourceLab'] == 3).all()
-        )
-    )
+    # Drop coding-GWAS rows only from single-variant (gene, disease) pairs,
+    # which the single-variant model cannot fit. A lone coding-GWAS variant
+    # in a multi-variant pair is kept for VIDRA.stan (legacy filtered per
+    # (disease, source, qtl) group, which also stripped it from those pairs).
+    n_pair_variants = gene_df.groupby('as_disease')['variant'].transform('nunique')
+    gene_df = gene_df[~((n_pair_variants == 1) & (gene_df['GsourceLab'] == 3))]
 
     return gene_df
 
