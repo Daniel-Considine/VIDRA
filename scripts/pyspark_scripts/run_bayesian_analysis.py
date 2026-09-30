@@ -705,7 +705,7 @@ def preprocess_gene(gene_df):
       1. Compute per-gene FoldX transform
       2. Fill annotation defaults + per-gene mean imputation + LoF hardcoding
       3. Dedup variants within (disease, source, qtl) — keep highest yc
-      4. Drop coding GWAS rows (GsourceLab==3) from single-variant pairs
+      4. Filter out single-variant coding GWAS groups (GsourceLab==3)
 
     Args:
         gene_df: pandas DataFrame for one gene (all diseases/variants)
@@ -783,12 +783,18 @@ def preprocess_gene(gene_df):
     )
 
     # --- Filter single-variant coding GWAS ---
-    # Drop coding-GWAS rows only from single-variant (gene, disease) pairs,
-    # which the single-variant model cannot fit. A lone coding-GWAS variant
-    # in a multi-variant pair is kept for VIDRA.stan (legacy filtered per
-    # (disease, source, qtl) group, which also stripped it from those pairs).
-    n_pair_variants = gene_df.groupby('as_disease')['variant'].transform('nunique')
-    gene_df = gene_df[~((n_pair_variants == 1) & (gene_df['GsourceLab'] == 3))]
+    # Legacy per-(disease, source, qtl) filter: drops a lone coding-GWAS
+    # variant even from multi-variant pairs. Kept deliberately — without an
+    # identified intercept, a lone coding variant cannot identify
+    # slope_random[3] but VIDRA.stan still pools it, which in validation
+    # widened the pooled slope ~60x and flipped 27% of signs.
+    gene_df = gene_df.groupby(
+        ['as_disease', 'GsourceLab', 'GqtlLab'], group_keys=False
+    ).filter(
+        lambda x: not (
+            (len(x['variant']) == 1) and (x['GsourceLab'] == 3).all()
+        )
+    )
 
     return gene_df
 
